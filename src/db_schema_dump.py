@@ -50,7 +50,7 @@ def db_schema_dump():
         # For each table, get a list of its columns
         for table in tables:
             table_name = table[0]
-            cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table_name,))
+            cursor.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = %s", (table_name,))
             columns = cursor.fetchall()
             data[table_name] = columns
 

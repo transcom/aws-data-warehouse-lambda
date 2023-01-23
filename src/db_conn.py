@@ -23,6 +23,8 @@ def get_connection():
             database=os.environ['db_name'],
             password=password,
             ssl_context=True,
+            timeout=900,
+            tcp_keepalive=True,
         )
         return conn
     except Exception as e:
