@@ -56,14 +56,28 @@ def db_extractor():
 
         # Get a list of all tables in the database
         cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
-        tables = cursor.fetchall()
+        #tmp_tables = cursor.fetchall()
+        tables_tmp = cursor.fetchall()
+
+        # Sanitize the table name's
+        tables_list = []
+        for tmp_table_name in tables_tmp:
+            tmp_table_name = tmp_table_name[0]
+            # remove any special characters or whitespaces
+            tmp_table_name = ''.join(e for e in tmp_table_name if e.isalnum() or e == '_')
+            # make sure the table name is lowercase
+            tmp_table_name = tmp_table_name.lower()
+            # add the sanitized table name to the list
+            tables_list.append(tmp_table_name)
+        tables = tuple(tables_list)
+
 
 #        table_dump_ignore = ['django_migrations', 'audit_history', 'archived_access_codes', 'schema_migration', 'audit_history_tableslist', 'awsdms_ddl_audit']
         table_dump_ignore = ['zip3_distances','transportation_service_provider_performances','django_migrations', 'audit_history', 'archived_access_codes', 'schema_migration', 'audit_history_tableslist', 'awsdms_ddl_audit']
 
         # For each table
         for table in tables:
-            table_name = table[0]
+            table_name = table
             # get a list of the table's columns
             cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name=%s", (table_name,))
             column_names = list(cursor.fetchall())
