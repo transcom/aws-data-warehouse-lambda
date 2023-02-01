@@ -33,7 +33,7 @@ and would look like this:
 {
     "data":
     {
-        "lastFileTime": "1970-01-01 00:00:00.000000+00:00",
+        "lastRunTime": "1970-01-01 00:00:00.000000",
         "serialNumber": 0
     },
     "schema":
