@@ -104,7 +104,7 @@ def db_extractor():
                 table_data = cursor.fetchall()
                 column_names = [desc[0] for desc in cursor.description]
                 data_with_col_names = [{column_names[i]: row[i] for i in range(len(column_names))} for row in table_data]
-                json_data = json.dumps(data_with_col_names, cls=UUIDEncoder)
+                json_data = json.dumps(data_with_col_names, cls=UUIDEncoder, default=str)
             # If we have created_at but no updated_at, we dump based only on created_at
             elif found_updated_at == False and found_created_at == True:
                 last_run_time = json_parameter_value['data']['lastRunTime']
