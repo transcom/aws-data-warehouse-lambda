@@ -94,6 +94,9 @@ def db_extractor():
             # By default we will want to write our data to S3, on error we will skip this
             write_to_s3 = True
 
+            # Set the statement timeout to 600 seconds for this session
+            cursor.execute("SET statement_timeout = '600s'")
+
             # If we ignore the table, we do nothing
             if str(table_name) in table_dump_ignore:
                 print("Data Warehouse Lambda - INFO - DB Extract - Didn't extract data for table(ignore list): " + str(table_name))
