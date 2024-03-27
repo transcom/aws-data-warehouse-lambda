@@ -73,7 +73,7 @@ def db_extractor():
 
 
 #        table_dump_ignore = ['django_migrations', 'audit_history', 'archived_access_codes', 'schema_migration', 'audit_history_tableslist', 'awsdms_ddl_audit']
-        table_dump_ignore = ['zip3_distances','transportation_service_provider_performances','move_to_gbloc', 'origin_duty_location_to_gbloc', 'django_migrations', 'audit_history', 'archived_access_codes', 'schema_migration', 'audit_history_tableslist', 'awsdms_ddl_audit']
+        table_dump_ignore = ['zip3_distances', 'transportation_service_provider_performances','move' ,'move_to_gbloc' , 'archived_access_codes', 'schema_migration', 'audit_history_tableslist']
 
         # For each table
         for table in tables:
