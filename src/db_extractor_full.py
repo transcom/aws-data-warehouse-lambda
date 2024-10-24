@@ -74,6 +74,7 @@ def db_extractor():
 
 #        table_dump_ignore = ['django_migrations', 'audit_history', 'archived_access_codes', 'schema_migration', 'audit_history_tableslist', 'awsdms_ddl_audit']
         table_dump_ignore = ['zip3_distances', 'transportation_service_provider_performances','move' ,'move_to_gbloc' , 'archived_access_codes', 'schema_migration', 'audit_history_tableslist']
+        table_large = ['transportation_accounting_codes'] 
 
         # For each table
         for table in tables:
@@ -101,6 +102,46 @@ def db_extractor():
             if str(table_name) in table_dump_ignore:
                 print("Data Warehouse Lambda - INFO - DB Extract - Didn't extract data for table(ignore list): " + str(table_name))
             # If we have neither timestamp field, we do a full dump
+            elif str(table_name) in table_large:
+                # Handle these table differently
+                print("Data Warehouse Lambda - INFO - DB Extract - Performing full dump on " + str(table_name))                
+                cursor.execute("SELECT * FROM " + str(table_name))
+                chunk_size = 800000
+                file_increment = 0
+                filelist = []
+                while True:
+                    results = cursor.fetchmany(chunk_size)
+                    if not results:
+                        break                                         
+                    column_names = [desc[0] for desc in cursor.description]
+                    data_with_col_names = [{column_names[i]: row[i] for i in range(len(column_names))} for row in results] 
+                    json_data = json.dumps(data_with_col_names, cls=UUIDEncoder, default=str)                        
+                    if write_to_s3 == True:
+                        try:
+                            s3 = boto3.client('s3')
+                            s3.put_object(Bucket=os.environ['bucket_name'], Key="db_data" + "/" + str(json_parameter_value['data']['serialNumber'] + 1).zfill(6) + "/" + table_name + "_" + str(file_increment) + ".json", Body=json_data, ServerSideEncryption='AES256')
+                            filelist.append("db_data" + "/" + str(json_parameter_value['data']['serialNumber'] + 1).zfill(6) + "/" + table_name + "_" + str(file_increment) + ".json")                      
+                            file_increment += 1
+                            print('Data Warehouse Lambda - INFO - DB Extract - Successfully wrote ' + os.environ['bucket_name'] + "/" + "db_data/" + "/"+str(json_parameter_value['data']['serialNumber'] + 1).zfill(6)+"/" + table_name + "_" + str(file_increment) + ".json")
+                        except Exception as e:
+                            print("Data Warehouse Lambda - ERROR - DB Extract - Error writing to S3" + str(e))                                
+                # #create single file
+                # combinedfile = []
+                # #get contents of multifile due to memory
+                # fileliststring = ','.join(str(x) for x in filelist)
+                # print('Data Warehouse Lambda - INFO - DB Extract - fileliststring ' + fileliststring)
+                # # Read and append data from each file
+                # for file in filelist:
+                #     print('Data Warehouse Lambda - INFO - DB Extract - file ' + str(file))
+                #     data = s3.get_object(Bucket=os.environ['bucket_name'], Key=file)
+                #     print('Data Warehouse Lambda - INFO - DB Extract - data ' + str(data)) 
+                #     content = json.loads(data['Body'].read().decode("utf-8"))
+                #     combinedfile.append(content)
+                # #finally write the new file    
+                # s3.put_object(Bucket=os.environ['bucket_name'], Key="db_data" + "/" + str(json_parameter_value['data']['serialNumber'] + 1).zfill(6) + "/" + table_name + ".json", Body=combinedfile, ServerSideEncryption='AES256')    
+                #clean up partial files
+                #for file in filelist:
+                    #s3.Object(os.environ['bucket_name'], file).delete()             
             elif found_updated_at == False and found_created_at == False:
                 print("Data Warehouse Lambda - INFO - DB Extract - Performing full dump on " + str(table_name))
                 cursor.execute("SELECT * FROM " + str(table_name))
