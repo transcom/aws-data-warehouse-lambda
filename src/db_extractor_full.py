@@ -125,6 +125,8 @@ def db_extractor():
                             file_increment += 1                            
                         except Exception as e:
                             print("Data Warehouse Lambda - ERROR - DB Extract - Error writing to S3" + str(e))   
+                            write_to_s3 = False                
+                            break
                 write_to_s3 = False                
             # If we have created_at but no updated_at, we dump based only on created_at
             elif found_updated_at == False and found_created_at == True:
