@@ -74,6 +74,8 @@ def db_extractor():
 
 #        table_dump_ignore = ['django_migrations', 'audit_history', 'archived_access_codes', 'schema_migration', 'audit_history_tableslist', 'awsdms_ddl_audit']
         table_dump_ignore = ['zip3_distances', 'transportation_service_provider_performances','move' ,'move_to_gbloc' , 'archived_access_codes', 'schema_migration', 'audit_history_tableslist']
+        #larger tables handle differently
+        table_size_large = ['audit_history','transportation_accounting_codes']
 
         # For each table
         for table in tables:
@@ -101,12 +103,12 @@ def db_extractor():
             if str(table_name) in table_dump_ignore:
                 print("Data Warehouse Lambda - INFO - DB Extract - Didn't extract data for table(ignore list): " + str(table_name))
             # If we have neither timestamp field, we do a full dump     
-            elif found_updated_at == False and found_created_at == False:
+            elif str(table_name) in table_size_large:
                 print("Data Warehouse Lambda - INFO - DB Extract - Performing full dump on " + str(table_name))                
                 cursor.execute("SELECT * FROM " + str(table_name))
-                    chunk_size = 800000
-                    file_increment = 1
-                    while True:
+                chunk_size = 800000
+                file_increment = 1
+                while True:
                     results = cursor.fetchmany(chunk_size)
                     if not results:
                         break                                         
@@ -118,16 +120,23 @@ def db_extractor():
                             s3 = boto3.client('s3')
                             if file_increment == 1:
                                 s3.put_object(Bucket=os.environ['bucket_name'], Key="db_data" + "/" + str(json_parameter_value['data']['serialNumber'] + 1).zfill(6) + "/" + table_name + ".json", Body=json_data, ServerSideEncryption='AES256')
-                                print('Data Warehouse Lambda - INFO - DB Extract - Successfully wrote ' + os.environ['bucket_name'] + "/" + "db_data/" + "/"+str(json_parameter_value['data']['serialNumber'] + 1).zfill(6)+"/" + table_name + ".json")
+                                print('Data Warehouse Lambda - INFO - DB Large Extract - Successfully wrote ' + os.environ['bucket_name'] + "/" + "db_data/" + "/"+str(json_parameter_value['data']['serialNumber'] + 1).zfill(6)+"/" + table_name + ".json")
                             else:    
                                 s3.put_object(Bucket=os.environ['bucket_name'], Key="db_data" + "/" + str(json_parameter_value['data']['serialNumber'] + 1).zfill(6) + "/" + table_name + "_" + str(file_increment) + ".json", Body=json_data, ServerSideEncryption='AES256')
-                                print('Data Warehouse Lambda - INFO - DB Extract - Successfully wrote ' + os.environ['bucket_name'] + "/" + "db_data/" + "/"+str(json_parameter_value['data']['serialNumber'] + 1).zfill(6)+"/" + table_name + "_" + str(file_increment) + ".json")
+                                print('Data Warehouse Lambda - INFO - DB Large Extract - Successfully wrote ' + os.environ['bucket_name'] + "/" + "db_data/" + "/"+str(json_parameter_value['data']['serialNumber'] + 1).zfill(6)+"/" + table_name + "_" + str(file_increment) + ".json")
                             file_increment += 1                            
                         except Exception as e:
-                            print("Data Warehouse Lambda - ERROR - DB Extract - Error writing to S3" + str(e))   
+                            print("Data Warehouse Lambda - ERROR - DB Large Extract - Error writing to S3" + str(e))   
                             write_to_s3 = False                
                             break
-                write_to_s3 = False
+                write_to_s3 = False                
+            elif found_updated_at == False and found_created_at == False:
+                print("Data Warehouse Lambda - INFO - DB Extract - Performing full dump on " + str(table_name))                
+                cursor.execute("SELECT * FROM " + str(table_name))
+                table_data = cursor.fetchall()
+                column_names = [desc[0] for desc in cursor.description]
+                data_with_col_names = [{column_names[i]: row[i] for i in range(len(column_names))} for row in table_data]
+                json_data = json.dumps(data_with_col_names, cls=UUIDEncoder, default=str)
             # If we have created_at but no updated_at, we dump based only on created_at
             elif found_updated_at == False and found_created_at == True:
                 last_run_time = json_parameter_value['data']['lastRunTime']
