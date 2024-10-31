@@ -205,9 +205,9 @@ def db_extractor():
 
         # Loop over each table and dump its data. Handling initial dump and incremental dumps on reruns
         for table in tables:
-            s3_key = f"db_data/{str(json_parameter_value['data']['serialNumber'] + 1).zfill(6)}/{table_name}.json"
-
             table_name = table
+
+            s3_key = f"db_data/{str(json_parameter_value['data']['serialNumber'] + 1).zfill(6)}/{table_name}.json"
             # get a list of the table's columns
             cursor.execute(
                 "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name=%s",
