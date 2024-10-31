@@ -213,7 +213,7 @@ def db_extractor():
                 "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name=%s",
                 (table_name,),
             )
-            column_names = list(cursor.fetchall())
+            column_names = [column[0] for column in cursor.fetchall()]
 
             # Determine whether we have the timestamp fields created_at and updated_at
             found_created_at = False
