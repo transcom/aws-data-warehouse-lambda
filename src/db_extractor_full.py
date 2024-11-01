@@ -51,15 +51,28 @@ def fetch_and_upload_cursor_results(
     buffer = io.BytesIO()
     buffer_size = 0
     min_part_size = 5 * 1024 * 1024  # 5 MB
+    first_record = True # Track the first record for JSON formatting
+
 
     try:
+        # Write the opening bracket for the JSON array
+        buffer.write(b'[')
+        buffer_size += 1
         # Fetch the results of the cursor query
         for batch in fetch_batches(cursor):
             data_with_col_names = (
                 map_row_to_columns(row, column_names) for row in batch
             )
             for record in data_with_col_names:
-                json_line = json.dumps(record, cls=UUIDEncoder, default=str) + "\n"
+                if not first_record:
+                    # Add comma before each record except the first
+                    buffer.write(b',')
+                    buffer_size += 1
+                else:
+                    # Set to False after processing the first record
+                    first_record = False 
+                
+                json_line = json.dumps(record, cls=UUIDEncoder, default=str)
                 json_line_bytes = json_line.encode("utf-8")
                 buffer.write(json_line_bytes)
                 buffer_size += len(json_line_bytes)
@@ -84,19 +97,27 @@ def fetch_and_upload_cursor_results(
 
                     gc.collect()
 
-        # Upload any remaining data in the buffer (Eg, the last batch finished with a part < 5MB)
-        if buffer_size > 0:
-            # Final part upload
-            buffer.seek(0)
-            response = s3_client.upload_part(
-                Bucket=bucket_name,
-                Key=key_name,
-                PartNumber=part_number,
-                UploadId=upload_id,
-                Body=buffer,
-            )
-            parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
-            buffer.close()
+        if first_record:
+            # No records were written, make a new buffer and write an empty array
+            buffer = io.BytesIO()
+            buffer.write(b'[]')
+            buffer_size = 2
+        else:
+            # Write closing bracket to close the JSON array
+            buffer.write(b']')
+            buffer_size += 1
+
+        # Upload the final part (Or only part if no records)
+        buffer.seek(0)
+        response = s3_client.upload_part(
+            Bucket=bucket_name,
+            Key=key_name,
+            PartNumber=part_number,
+            UploadId=upload_id,
+            Body=buffer,
+        )
+        parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
+        buffer.close()
 
         if parts:
             # Complete multipart upload
