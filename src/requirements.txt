@@ -2,3 +2,5 @@ pg8000==1.29.4
 scramp>=1.4.3
 six>=1.5
 asn1crypto==1.5.1
+boto3>=1.35.51
+boto3-stubs
