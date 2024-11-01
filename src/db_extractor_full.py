@@ -1,3 +1,5 @@
+import multiprocessing
+from multiprocessing.connection import Connection as multi_processing_connection
 import boto3
 import pg8000
 import json
@@ -7,10 +9,8 @@ import os
 from uuid import UUID
 import datetime
 import gc
-
-# Declare the global connection object to use during warm starting
-# to reuse connections that were established during a previous invocation.
-connection = None
+from multiprocessing import Process, Pipe
+from typing import List, Tuple
 
 # Storing current time, we will use this to update SSM when finished so that we
 # know for the next run which time to select from
@@ -19,6 +19,11 @@ current_run_time = datetime.datetime.now()
 # Define batch size fetching of records for json dumps
 batch_size = 100000
 
+# Lambda global connection for warm starts
+# This connection is only used to grab the table names
+# When multiprocessing, the child processes each create their own
+# connection
+connection = None
 
 # Class to format json UUID's
 class UUIDEncoder(json.JSONEncoder):
@@ -139,6 +144,93 @@ def map_row_to_columns(row, column_names):
     return {column_names[i]: row[i] for i in range(len(column_names))}
 
 
+def table_extractor(
+    table_name,
+    json_parameter_value,
+    bucket_name,
+    child_conn: multi_processing_connection,
+):
+    try:
+        connection = db_conn.get_connection()
+        if connection is None:
+            error_msg = (
+                f"Failed to connect to database during child process for {table_name}"
+            )
+            print(f"Data Warehouse Lambda - ERROR - DB Extract - {error_msg}")
+            child_conn.send(error_msg)
+            return
+        print(
+            f"Data Warehouse Lambda - INFO - Child extraction process created for table {table_name}"
+        )
+        s3_key = f"db_data/{str(json_parameter_value['data']['serialNumber'] + 1).zfill(6)}/{table_name}.json"
+        cursor = connection.cursor()  # type: ignore
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name=%s",
+            (table_name,),
+        )
+        column_names = [column[0] for column in cursor.fetchall()]
+
+        # Determine whether we have the timestamp fields created_at and updated_at
+        found_created_at = False
+        found_updated_at = False
+        for column in column_names:
+            if "updated_at" in column:
+                found_updated_at = True
+            if "created_at" in column:
+                found_created_at = True
+
+        # Set the statement timeout to 600 seconds for this session
+        cursor.execute("SET statement_timeout = '600s'")
+
+        # Handle if the table being iterated on does not have updated_at or created_at
+        # Since we do not have timestamps to compare to, we must full dump the table without updated or created at
+        if found_updated_at == False and found_created_at == False:
+            print(
+                "Data Warehouse Lambda - INFO - DB Extract - Performing full dump on "
+                + str(table_name)
+            )
+            # Tell the database to execute this query, we will ingest it in chunks
+            cursor.execute("SELECT * FROM " + str(table_name))
+            # Fetch cursor results and upload to S3
+            fetch_and_upload_cursor_results(cursor, bucket_name, s3_key, column_names)
+        # If we have created_at but no updated_at, we dump based only on created_at
+        elif found_updated_at == False and found_created_at == True:
+            last_run_time = json_parameter_value["data"]["lastRunTime"]
+            cursor.execute(
+                "SELECT * FROM "
+                + str(table_name)
+                + " where (created_at > '"
+                + str(last_run_time)
+                + "') order by created_at;"
+            )
+            fetch_and_upload_cursor_results(cursor, bucket_name, s3_key, column_names)
+        # If we have created_at and updated_at, we dump based on both
+        elif found_updated_at == True and found_created_at == True:
+            last_run_time = json_parameter_value["data"]["lastRunTime"]
+            cursor.execute(
+                "SELECT * FROM "
+                + str(table_name)
+                + " where ((created_at > %s) OR (updated_at > %s)) order by created_at;",
+                (last_run_time, last_run_time),
+            )
+            fetch_and_upload_cursor_results(cursor, bucket_name, s3_key, column_names)
+        else:
+            print(
+                "Data Warehouse Lambda - ERROR - DB Extract - "
+                + str(table_name)
+                + " does not match any criteria for data warehousing"
+            )
+
+        # Main child process complete
+        child_conn.send(f"Successfully processed {table_name}")
+    except Exception as e:
+        error_msg = f"Error processing {table_name}: {e}"
+        print(f"Data Warehouse Lambda - ERROR - DB Extract - {error_msg}")
+        child_conn.send(error_msg)
+    finally:
+        child_conn.close()
+
+
 def db_extractor():
     # Use the get_parameter method of the SSM client to retrieve the parameter
     try:
@@ -203,80 +295,51 @@ def db_extractor():
         # S3 bucket upload location
         bucket_name = os.environ["bucket_name"]
 
-        # Loop over each table and dump its data. Handling initial dump and incremental dumps on reruns
-        for table in tables:
-            table_name = table
+        # Filter out ignored tables
+        tables = [table for table in tables_list if table not in table_dump_ignore]
 
-            s3_key = f"db_data/{str(json_parameter_value['data']['serialNumber'] + 1).zfill(6)}/{table_name}.json"
-            # get a list of the table's columns
-            cursor.execute(
-                "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name=%s",
-                (table_name,),
-            )
-            column_names = [column[0] for column in cursor.fetchall()]
+        # Create multi processes for the number of tables we have
+        # for the number of processors we have
+        cursor.close()  # Close the current cursor, we are done with it. Child processes make new ones
 
-            # Determine whether we have the timestamp fields created_at and updated_at
-            found_created_at = False
-            found_updated_at = False
-            for column in column_names:
-                if "updated_at" in column:
-                    found_updated_at = True
-                if "created_at" in column:
-                    found_created_at = True
+        # Process each table in a separate Process with Pipe
+        max_processes = multiprocessing.cpu_count()  # Retrieve processor limit
+        table_index = iter(tables)
+        processes: List[Tuple[Process, multi_processing_connection]] = (
+            []
+        )  # Holds the individual processes in tuples with the parent pipes
 
-            # Set the statement timeout to 600 seconds for this session
-            cursor.execute("SET statement_timeout = '600s'")
+        while True:
+            while len(processes) < max_processes:
+                try:
+                    table_name = next(table_index)
+                except StopIteration:
+                    # This exception is thrown when the next function can't find anything
+                    break
+                parent_conn, child_conn = Pipe()
+                process = Process(
+                    target=table_extractor,
+                    args=(table_name, json_parameter_value, bucket_name, child_conn),
+                )
+                processes.append((process, parent_conn))
+                process.start()
+            if not processes:
+                # No remaining processes are active
+                break
 
-            # If we ignore the table, we do nothing
-            if str(table_name) in table_dump_ignore:
-                print(
-                    "Data Warehouse Lambda - INFO - DB Extract - Didn't extract data for table(ignore list): "
-                    + str(table_name)
-                )
-            # Handle if the table being iterated on does not have updated_at or created_at
-            # Since we do not have timestamps to compare to, we must full dump the table without updated or created at
-            elif found_updated_at == False and found_created_at == False:
-                print(
-                    "Data Warehouse Lambda - INFO - DB Extract - Performing full dump on "
-                    + str(table_name)
-                )
-                # Tell the database to execute this query, we will ingest it in chunks
-                cursor.execute("SELECT * FROM " + str(table_name))
-                # Fetch cursor results and upload to S3
-                fetch_and_upload_cursor_results(
-                    cursor, bucket_name, s3_key, column_names
-                )
-            # If we have created_at but no updated_at, we dump based only on created_at
-            elif found_updated_at == False and found_created_at == True:
-                last_run_time = json_parameter_value["data"]["lastRunTime"]
-                cursor.execute(
-                    "SELECT * FROM "
-                    + str(table_name)
-                    + " where (created_at > '"
-                    + str(last_run_time)
-                    + "') order by created_at;"
-                )
-                fetch_and_upload_cursor_results(
-                    cursor, bucket_name, s3_key, column_names
-                )
-            # If we have created_at and updated_at, we dump based on both
-            elif found_updated_at == True and found_created_at == True:
-                last_run_time = json_parameter_value["data"]["lastRunTime"]
-                cursor.execute(
-                    "SELECT * FROM "
-                    + str(table_name)
-                    + " where ((created_at > %s) OR (updated_at > %s)) order by created_at;",
-                    (last_run_time, last_run_time),
-                )
-                fetch_and_upload_cursor_results(
-                    cursor, bucket_name, s3_key, column_names
-                )
-            else:
-                print(
-                    "Data Warehouse Lambda - ERROR - DB Extract - "
-                    + str(table_name)
-                    + " does not match any criteria for data warehousing"
-                )
+            # Manage processes concurrently without sequential waiting
+            for i in range(len(processes) - 1, -1, -1):
+                process, pipe = processes[i]
+                if not process.is_alive():
+                    # Process has finished, poll it and receive its message
+                    if pipe.poll():
+                        message = pipe.recv()
+                        print(f"Data Warehouse Lambda - INFO - {message}")
+                    pipe.close()
+                    process.join()
+                    processes.pop(
+                        i
+                    )  # Remove the finished process to free up processor capacity
 
         # Create an SSM client
         try:
