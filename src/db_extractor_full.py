@@ -17,7 +17,7 @@ from typing import List, Tuple
 current_run_time = datetime.datetime.now()
 
 # Define batch size fetching of records for json dumps
-batch_size = 100000
+batch_size = 500000
 
 # Lambda global connection for warm starts
 # This connection is only used to grab the table names
@@ -51,7 +51,7 @@ def fetch_and_upload_cursor_results(
     part_number = 1
     buffer = io.BytesIO()
     buffer_size = 0
-    min_part_size = 5 * 1024 * 1024  # 5 MB
+    min_part_size = 50 * 1024 * 1024  # 50 MB
     first_record = True  # Track the first record for JSON formatting
 
     try:
