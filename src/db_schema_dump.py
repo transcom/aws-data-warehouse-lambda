@@ -44,7 +44,7 @@ def db_schema_dump():
         data = {}
 
         # Get a list of all tables in the database
-        cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+        cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name NOT in ('audit_history','v_locations') ")
         tables = cursor.fetchall()
 
         # For each table, get a list of its columns

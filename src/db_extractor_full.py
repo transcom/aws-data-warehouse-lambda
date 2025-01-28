@@ -311,6 +311,8 @@ def db_extractor():
             "archived_access_codes",
             "schema_migration",
             "audit_history_tableslist",
+            "audit_history",
+            "v_locations",
         ]
 
         # S3 bucket upload location
