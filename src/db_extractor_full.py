@@ -64,14 +64,13 @@ def fetch_and_upload_cursor_results(
                 map_row_to_columns(row, column_names) for row in batch
             )
             for record in data_with_col_names:
-                if not first_record:
+                if first_record:
+                    # Set to False after processing the first record
+                    first_record = False                    
+                else:
                     # Add comma before each record except the first
                     buffer.write(b",")
                     buffer_size += 1
-                else:
-                    # Set to False after processing the first record
-                    first_record = False
-
                 json_line = json.dumps(record, cls=UUIDEncoder, default=str)
                 json_line_bytes = json_line.encode("utf-8")
                 buffer.write(json_line_bytes)
