@@ -17,7 +17,7 @@ from typing import List, Tuple
 current_run_time = datetime.datetime.now()
 
 # Define batch size fetching of records for json dumps
-batch_size = 500000
+batch_size = 100000
 
 # Lambda global connection for warm starts
 # This connection is only used to grab the table names
@@ -25,6 +25,7 @@ batch_size = 500000
 # connection
 connection = None
 
+max_processes = multiprocessing.cpu_count()  # Processor limit
 
 # Class to format json UUID's
 class UUIDEncoder(json.JSONEncoder):
@@ -34,6 +35,25 @@ class UUIDEncoder(json.JSONEncoder):
             return obj.hex
         return json.JSONEncoder.default(self, obj)
 
+def parallel_worker(worker_conn, batch, column_names):
+    # Handle process worker -> back to json mapping and
+    # respond it back via the pipe. We'll convert a batch
+    # of rows into JSON and then close the pipe with our response
+    try:
+        fragment = convert_batch_to_json(batch, column_names)
+        worker_conn.send(("fragment", fragment))
+    except Exception as e:
+        worker_conn.send(("error", f"ERROR: {e}"))
+    finally:
+        worker_conn.close()
+
+def convert_batch_to_json(batch, column_names):
+    # Convert a batch of rows to comma delimited JSON fragments (No start/end brackets)
+    records = []
+    for row in batch:
+        as_dict = map_row_to_columns(row, column_names)
+        records.append(json.dumps(as_dict, cls=UUIDEncoder, default=str))
+    return ",".join(records).encode("utf-8") # Return as bytes
 
 #  Helper function to batch fetch data and use multipart uploading with S3
 def fetch_and_upload_cursor_results(
@@ -52,74 +72,25 @@ def fetch_and_upload_cursor_results(
     buffer = io.BytesIO()
     buffer_size = 0
     min_part_size = 50 * 1024 * 1024  # 50 MB
-    first_record = True  # Track the first record for JSON formatting
-
-    try:
-        # Write the opening bracket for the JSON array
-        buffer.write(b"[")
-        buffer_size += 1
-        # Fetch the results of the cursor query
-        for batch in fetch_batches(cursor):
-            data_with_col_names = (
-                map_row_to_columns(row, column_names) for row in batch
-            )
-            for record in data_with_col_names:
-                if first_record:
-                    # Set to False after processing the first record
-                    first_record = False                    
-                else:
-                    # Add comma before each record except the first
-                    buffer.write(b",")
-                    buffer_size += 1
-                json_line = json.dumps(record, cls=UUIDEncoder, default=str)
-                json_line_bytes = json_line.encode("utf-8")
-                buffer.write(json_line_bytes)
-                buffer_size += len(json_line_bytes)
-
-                # Upload part if buffer reaches the minimum part size of 5MB
-                if buffer_size >= min_part_size:
-                    # This part is now finished being appended too
-                    # Trigger upload, reset buffer, and proceed with the next one
-                    buffer.seek(0)
-                    response = s3_client.upload_part(
-                        Bucket=bucket_name,
-                        Key=key_name,
-                        PartNumber=part_number,
-                        UploadId=upload_id,
-                        Body=buffer,
-                    )
-                    parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
-                    part_number += 1
-                    buffer.close()
-                    buffer = io.BytesIO()
-                    buffer_size = 0
-
-                    gc.collect()
-
-        if first_record:
-            # No records were written, make a new buffer and write an empty array
-            buffer = io.BytesIO()
+    
+    batches = list(fetch_batches(cursor))
+    total_batches = len(batches)
+    print(f"Data Warehouse Lambda - INFO - {total_batches} batches found for {key_name}")
+    
+    # Handle case of no records to convert to JSON
+    if total_batches == 0:
+        # No records, make a new buffer and write an empty array for the dump
+        try:
             buffer.write(b"[]")
-            buffer_size = 2
-        else:
-            # Write closing bracket to close the JSON array
-            buffer.write(b"]")
-            buffer_size += 1
-
-        # Upload the final part (Or only part if no records)
-        buffer.seek(0)
-        response = s3_client.upload_part(
-            Bucket=bucket_name,
-            Key=key_name,
-            PartNumber=part_number,
-            UploadId=upload_id,
-            Body=buffer,
-        )
-        parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
-        buffer.close()
-
-        if parts:
-            # Complete multipart upload
+            buffer.seek(0)
+            response = s3_client.upload_part(
+                Bucket=bucket_name,
+                Key=key_name,
+                PartNumber=part_number,
+                UploadId=upload_id,
+                Body=buffer,
+            )
+            parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
             s3_client.complete_multipart_upload(
                 Bucket=bucket_name,
                 Key=key_name,
@@ -129,25 +100,110 @@ def fetch_and_upload_cursor_results(
             print(
                 f"Data Warehouse Lambda - INFO - DB Extract - Successfully wrote {bucket_name}/{key_name}"
             )
-        else:
-            # Abort the multipart upload if no parts were uploaded
+        except Exception as e:
+            # Abort multipart upload in case of failure
             s3_client.abort_multipart_upload(
                 Bucket=bucket_name, Key=key_name, UploadId=upload_id
             )
             print(
-                f"Data Warehouse Lambda - INFO - No data to upload for table {key_name}"
+                f"Data Warehouse Lambda - ERROR - DB Extract - Error during multipart upload: {e}"
             )
+            raise e
+        # Early return
+        return
+    
+    # Create a manager -> worker process for each batch in parallel
+    # This makes a manager and worker combo for every batch that we will await later
+    workers: List[Tuple[Process, multi_processing_connection, int]] = []
+    for i, batch in enumerate(batches):
+        manager, worker = Pipe()
+        p = Process(target=parallel_worker, args=(worker, batch, column_names))
+        workers.append((p, manager, i))
+        p.start()
+            
+    #
+    # Start our JSON output document
+    #
+    # Begin with our bracket as we are
+    # going to format this manually
+    buffer.write(b"[")
+    buffer_size += 1
 
-    except Exception as e:
-        # Abort multipart upload in case of failure
-        s3_client.abort_multipart_upload(
-            Bucket=bucket_name, Key=key_name, UploadId=upload_id
-        )
-        print(
-            f"Data Warehouse Lambda - ERROR - DB Extract - Error during multipart upload: {e}"
-        )
-        raise e
+    # Concurrently wait for the workers to be complete
+    while workers:
+        for i in range(len(workers) - 1, -1, -1): # Backwards loop because we pop list entries
+            process, manager, batch_index = workers[i]
+            # Loop over the workers infinitely until we are out of workers
+            # or until we find a worker whose process has completed
+            if not process.is_alive():
+                print(
+                f"Data Warehouse Lambda - DEBUG - DB Extract - {key_name} worker for batch index {batch_index} complete, polling it now. {len(workers)} workers remain"
+                )
+                is_last_worker = len(workers) == 1
+                # Process completed and worker has a letter for us
+                if manager.poll():
+                    # Have the manager receive the worker's data
+                    msg_type, data = manager.recv()
+                    if msg_type == "error":
+                        print(f"Data Warehouse Lambda - ERROR - Worker {batch_index} failed: {data}")
+                        raise RuntimeError(f"Worker {batch_index} error: {data}")
+                    print(
+                    f"Data Warehouse Lambda - DEBUG - DB Extract - {key_name} worker for batch index {batch_index} polled successfully. {len(workers)} workers remain"
+                    )
+                    # Add data fragment to buffer
+                    buffer.write(data)
+                    buffer_size += len(data)
+                    
+                    if not is_last_worker:
+                        # If it's not the last worker, append `,` to support a final
+                        # [${worker_1_json}, ${worker_2_json}, ${worker_3_json}] output
+                        buffer.write(b",")
+                        buffer_size += 1
+                        
+                    # Upload part if buffer reaches the minimum part size or
+                    # if this is the final worker
+                    if buffer_size >= min_part_size or is_last_worker:
+                        if is_last_worker:
+                            # Last call, close it up!
+                            buffer.write(b"]")
+                            buffer_size += 1
+                        buffer.seek(0)
+                        response = s3_client.upload_part(
+                            Bucket=bucket_name,
+                            Key=key_name,
+                            PartNumber=part_number,
+                            UploadId=upload_id,
+                            Body=buffer,
+                        )
+                        parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
+                        part_number += 1
+                        buffer.close()
+                        buffer = io.BytesIO()
+                        buffer_size = 0
 
+                        gc.collect()
+                manager.close() # Free thread
+                process.join() # Make sure worker is done
+                workers.pop(i) # Clear the worker
+                
+
+    print(
+    f"Data Warehouse Lambda - DEBUG - DB Extract - {key_name} workers complete, announcing multipart completion"
+    )
+
+    # Workers have completed and there is nothing left to upload to the multi-part
+    buffer.close()
+    del buffer
+    # Announce multipart upload completion
+    s3_client.complete_multipart_upload(
+        Bucket=bucket_name,
+        Key=key_name,
+        UploadId=upload_id,
+        MultipartUpload={"Parts": parts},
+    )
+    print(
+        f"Data Warehouse Lambda - INFO - DB Extract - Successfully wrote {bucket_name}/{key_name}"
+    )
 
 # Helper func to yield results rather than return
 # to boost processing efficiency
@@ -324,13 +380,18 @@ def db_extractor():
         # for the number of processors we have
         cursor.close()  # Close the current cursor, we are done with it. Child processes make new ones
 
-        # Process each table in a separate Process with Pipe
-        max_processes = multiprocessing.cpu_count()  # Retrieve processor limit
+        # Process each table in a separate Process with Pipe  
         table_index = iter(tables)
         processes: List[Tuple[Process, multi_processing_connection]] = (
             []
         )  # Holds the individual processes in tuples with the parent pipes
-
+        
+        # TODO: Logic to handle only 1-2 processors
+        # or fail if there are 2 processors or less
+        print(
+            f"Data Warehouse Lambda - INFO - {max_processes} processors available for use"
+        )
+        
         while True:
             while len(processes) < max_processes:
                 try:
