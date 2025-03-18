@@ -3,6 +3,7 @@ from multiprocessing.connection import Connection as multi_processing_connection
 import boto3
 import pg8000
 import json
+import time
 import io
 import db_conn
 import os
@@ -16,12 +17,17 @@ from typing import List, Tuple
 # know for the next run which time to select from
 current_run_time = datetime.datetime.now()
 
+# Called to sleep the current thread and allow the workers
+# more processors
+def yield_for_workers():
+    time.sleep(15)
+
 # Define batch size fetching of records for json dumps
 batch_size = 100000
 
 # Lambda global connection for warm starts
 # This connection is only used to grab the table names
-# When multiprocessing, the child processes each create their own
+# When multiprocessing, the worker processes each create their own
 # connection
 connection = None
 
@@ -133,6 +139,8 @@ def fetch_and_upload_cursor_results(
     while workers:
         for i in range(len(workers) - 1, -1, -1): # Backwards loop because we pop list entries
             process, manager, batch_index = workers[i]
+            # Temporarily free this processor so the workers can use it
+            yield_for_workers()
             # Loop over the workers infinitely until we are out of workers
             # or until we find a worker whose process has completed
             if not process.is_alive():
@@ -224,19 +232,19 @@ def table_extractor(
     table_name,
     json_parameter_value,
     bucket_name,
-    child_conn: multi_processing_connection,
+    worker: multi_processing_connection,
 ):
     try:
         connection = db_conn.get_connection()
         if connection is None:
             error_msg = (
-                f"Failed to connect to database during child process for {table_name}"
+                f"Failed to connect to database during worker process for {table_name}"
             )
             print(f"Data Warehouse Lambda - ERROR - DB Extract - {error_msg}")
-            child_conn.send(error_msg)
+            worker.send(error_msg)
             return
         print(
-            f"Data Warehouse Lambda - INFO - Child extraction process created for table {table_name}"
+            f"Data Warehouse Lambda - INFO - Worker extraction process created for table {table_name}"
         )
         s3_key = f"db_data/{str(json_parameter_value['data']['serialNumber'] + 1).zfill(6)}/{table_name}.json"
         cursor = connection.cursor()  # type: ignore
@@ -297,14 +305,14 @@ def table_extractor(
                 + " does not match any criteria for data warehousing"
             )
 
-        # Main child process complete
-        child_conn.send(f"Successfully processed {table_name}")
+        # Worker process complete
+        worker.send(f"Successfully processed {table_name}")
     except Exception as e:
         error_msg = f"Error processing {table_name}: {e}"
         print(f"Data Warehouse Lambda - ERROR - DB Extract - {error_msg}")
-        child_conn.send(error_msg)
+        worker.send(error_msg)
     finally:
-        child_conn.close()
+        worker.close()
 
 
 def db_extractor():
@@ -378,13 +386,13 @@ def db_extractor():
 
         # Create multi processes for the number of tables we have
         # for the number of processors we have
-        cursor.close()  # Close the current cursor, we are done with it. Child processes make new ones
+        cursor.close()  # Close the current cursor, we are done with it. Worker processes make new ones
 
         # Process each table in a separate Process with Pipe  
         table_index = iter(tables)
         processes: List[Tuple[Process, multi_processing_connection]] = (
             []
-        )  # Holds the individual processes in tuples with the parent pipes
+        )  # Holds the individual processes in tuples with the parent/manager pipes
         
         # TODO: Logic to handle only 1-2 processors
         # or fail if there are 2 processors or less
@@ -399,19 +407,21 @@ def db_extractor():
                 except StopIteration:
                     # This exception is thrown when the next function can't find anything
                     break
-                parent_conn, child_conn = Pipe()
+                manager, worker = Pipe()
                 process = Process(
                     target=table_extractor,
-                    args=(table_name, json_parameter_value, bucket_name, child_conn),
+                    args=(table_name, json_parameter_value, bucket_name, worker),
                 )
-                processes.append((process, parent_conn))
+                processes.append((process, manager))
                 process.start()
             if not processes:
                 # No remaining processes are active
                 break
-
+            
             # Manage processes concurrently without sequential waiting
             for i in range(len(processes) - 1, -1, -1):
+                # Temporarily free this processor so the workers can use it
+                yield_for_workers()
                 process, pipe = processes[i]
                 if not process.is_alive():
                     # Process has finished, poll it and receive its message
