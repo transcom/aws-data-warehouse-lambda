@@ -12,6 +12,7 @@ import os
 from uuid import UUID
 import datetime
 import gc
+import traceback
 from typing import List, Tuple
 
 # Storing current time, we will use this to update SSM when finished so that we
@@ -37,7 +38,7 @@ class UUIDEncoder(json.JSONEncoder):
             return obj.hex
         return json.JSONEncoder.default(self, obj)
 
-def parallel_worker(worker_conn, batch, column_names):
+def parallel_worker(worker_conn, batch, column_names, key_name):
     # Handle process worker -> back to json mapping and
     # respond it back via the pipe. We'll convert a batch
     # of rows into JSON and then close the pipe with our response
@@ -45,7 +46,8 @@ def parallel_worker(worker_conn, batch, column_names):
         fragment = convert_batch_to_json(batch, column_names)
         worker_conn.send(("fragment", fragment))
     except Exception as e:
-        worker_conn.send(("error", f"ERROR: {e}"))
+        tb = traceback.format_exc()
+        worker_conn.send(("error", f"ERROR: {e}\nKEY: {key_name}\nTrace: {tb}"))
     finally:
         worker_conn.close()
 
@@ -75,12 +77,16 @@ def fetch_and_upload_cursor_results(
     buffer_size = 0
     min_part_size = 50 * 1024 * 1024  # 50 MB
     
-    batches = list(fetch_batches(cursor))
-    total_batches = len(batches)
-    print(f"Data Warehouse Lambda - INFO - {total_batches} batches found for {key_name}")
+    batch_generator = fetch_batches(cursor)
     
-    # Handle case of no records to convert to JSON
-    if total_batches == 0:
+    # Since a generator doesn't return a list, check the first case of if it is empty
+    try:
+        first_batch = next(batch_generator)
+    except StopIteration:
+        # This exception WILL be thrown if no SQL records return
+        first_batch = None
+
+    if first_batch is None:
         # No records, make a new buffer and write an empty array for the dump
         try:
             buffer.write(b"[]")
@@ -117,10 +123,17 @@ def fetch_and_upload_cursor_results(
     # Create a manager -> worker process for each batch in parallel
     # This makes a manager and worker combo for every batch that we will await later
     workers: List[Tuple[Process, multi_processing_connection, int]] = []
-    for i, batch in enumerate(batches):
+    # Make sure we still process the first batch
+    # fb = first batch
+    fbManager, fbWorker = Pipe()
+    fbp = Process(target=parallel_worker, args=(fbWorker, first_batch, column_names, key_name))
+    workers.append((fbp, fbManager, 1))
+    fbp.start()
+    # Process remaining batches from the generator
+    for i, batch in enumerate(batch_generator):
         manager, worker = Pipe()
-        p = Process(target=parallel_worker, args=(worker, batch, column_names))
-        workers.append((p, manager, i))
+        p = Process(target=parallel_worker, args=(worker, batch, column_names, key_name))
+        workers.append((p, manager, i+1)) # +1 because of first batch preceding this
         p.start()
 
     #
@@ -299,7 +312,7 @@ def table_extractor(
         # Worker process complete
         worker.send(f"Successfully processed {table_name}")
     except Exception as e:
-        error_msg = f"Error processing {table_name}: {e}"
+        error_msg = f"Error processing {table_name}: {repr(e)}"
         print(f"Data Warehouse Lambda - ERROR - DB Extract - {error_msg}")
         worker.send(error_msg)
     finally:
