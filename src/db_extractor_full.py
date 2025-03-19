@@ -1,29 +1,25 @@
 import multiprocessing
 from multiprocessing.connection import Connection as multi_processing_connection
+from multiprocessing.connection import wait
+from multiprocessing import Process, Pipe
+from socket import socket
 import boto3
 import pg8000
 import json
-import time
 import io
 import db_conn
 import os
 from uuid import UUID
 import datetime
 import gc
-from multiprocessing import Process, Pipe
 from typing import List, Tuple
 
 # Storing current time, we will use this to update SSM when finished so that we
 # know for the next run which time to select from
 current_run_time = datetime.datetime.now()
 
-# Called to sleep the current thread and allow the workers
-# more processors
-def yield_for_workers():
-    time.sleep(15)
-
-# Define batch size fetching of records for json dumps
-batch_size = 100000
+# How many SQL records a worker will fetch at a time
+batch_size = 50000
 
 # Lambda global connection for warm starts
 # This connection is only used to grab the table names
@@ -115,7 +111,7 @@ def fetch_and_upload_cursor_results(
                 f"Data Warehouse Lambda - ERROR - DB Extract - Error during multipart upload: {e}"
             )
             raise e
-        # Early return
+        # Early return, mark process to no longer be alive
         return
     
     # Create a manager -> worker process for each batch in parallel
@@ -126,7 +122,7 @@ def fetch_and_upload_cursor_results(
         p = Process(target=parallel_worker, args=(worker, batch, column_names))
         workers.append((p, manager, i))
         p.start()
-            
+
     #
     # Start our JSON output document
     #
@@ -134,69 +130,65 @@ def fetch_and_upload_cursor_results(
     # going to format this manually
     buffer.write(b"[")
     buffer_size += 1
+    
+    print(f'Data Warehouse Lambda - INFO - {key_name} has {len(workers)} workers')
 
     # Concurrently wait for the workers to be complete
     while workers:
-        for i in range(len(workers) - 1, -1, -1): # Backwards loop because we pop list entries
-            process, manager, batch_index = workers[i]
-            # Temporarily free this processor so the workers can use it
-            yield_for_workers()
-            # Loop over the workers infinitely until we are out of workers
-            # or until we find a worker whose process has completed
-            if not process.is_alive():
-                print(
-                f"Data Warehouse Lambda - DEBUG - DB Extract - {key_name} worker for batch index {batch_index} complete, polling it now. {len(workers)} workers remain"
-                )
-                is_last_worker = len(workers) == 1
-                # Process completed and worker has a letter for us
-                if manager.poll():
-                    # Have the manager receive the worker's data
-                    msg_type, data = manager.recv()
-                    if msg_type == "error":
-                        print(f"Data Warehouse Lambda - ERROR - Worker {batch_index} failed: {data}")
-                        raise RuntimeError(f"Worker {batch_index} error: {data}")
-                    print(
-                    f"Data Warehouse Lambda - DEBUG - DB Extract - {key_name} worker for batch index {batch_index} polled successfully. {len(workers)} workers remain"
-                    )
-                    # Add data fragment to buffer
-                    buffer.write(data)
-                    buffer_size += len(data)
-                    
-                    if not is_last_worker:
-                        # If it's not the last worker, append `,` to support a final
-                        # [${worker_1_json}, ${worker_2_json}, ${worker_3_json}] output
-                        buffer.write(b",")
-                        buffer_size += 1
-                        
-                    # Upload part if buffer reaches the minimum part size or
-                    # if this is the final worker
-                    if buffer_size >= min_part_size or is_last_worker:
-                        if is_last_worker:
-                            # Last call, close it up!
-                            buffer.write(b"]")
-                            buffer_size += 1
-                        buffer.seek(0)
-                        response = s3_client.upload_part(
-                            Bucket=bucket_name,
-                            Key=key_name,
-                            PartNumber=part_number,
-                            UploadId=upload_id,
-                            Body=buffer,
-                        )
-                        parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
-                        part_number += 1
-                        buffer.close()
-                        buffer = io.BytesIO()
-                        buffer_size = 0
+        finished_workers: List[multi_processing_connection | socket | int] = wait([mgr for (proc, mgr, bIndex) in workers], timeout=None)
+        for finished_worker in finished_workers:
+            is_last_worker = len(workers) == 1
+            for i, (proc, mgr, batch_index) in enumerate(workers):
+                if mgr is finished_worker:
+                    if mgr.poll():
+                        msg_type, data = mgr.recv()
+                        mgr.close() # Free thread
+                        proc.join() # Make sure worker is done
+                        workers.pop(i) # Clear the worker
 
-                        gc.collect()
-                manager.close() # Free thread
-                process.join() # Make sure worker is done
-                workers.pop(i) # Clear the worker
-                
+                        if msg_type == "error":
+                            print(f"Data Warehouse Lambda - ERROR - Worker {batch_index} failed: {data}")
+                            raise RuntimeError(f"Worker {batch_index} error: {data}")
+                        print(
+                        f"Data Warehouse Lambda - INFO - DB Extract - {key_name} worker for batch index {batch_index} polled successfully. {len(workers)} workers remain"
+                        )
+                        # Add data fragment to buffer
+                        buffer.write(data)
+                        buffer_size += len(data)
+                        
+                        if not is_last_worker:
+                            # If it's not the last worker, append `,` to support a final
+                            # [${worker_1_json}, ${worker_2_json}, ${worker_3_json}] output
+                            buffer.write(b",")
+                            buffer_size += 1
+                            
+                        # Upload part if buffer reaches the minimum part size or
+                        # if this is the final worker
+                        if buffer_size >= min_part_size or is_last_worker:
+                            if is_last_worker:
+                                # Last call, close it up!
+                                buffer.write(b"]")
+                                buffer_size += 1
+                            buffer.seek(0)
+                            response = s3_client.upload_part(
+                                Bucket=bucket_name,
+                                Key=key_name,
+                                PartNumber=part_number,
+                                UploadId=upload_id,
+                                Body=buffer,
+                            )
+                            parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
+                            part_number += 1
+                            buffer.close()
+                            buffer = io.BytesIO()
+                            buffer_size = 0
+
+                            gc.collect()
+
+
 
     print(
-    f"Data Warehouse Lambda - DEBUG - DB Extract - {key_name} workers complete, announcing multipart completion"
+    f"Data Warehouse Lambda - INFO - DB Extract - {key_name} workers complete, announcing multipart completion"
     )
 
     # Workers have completed and there is nothing left to upload to the multi-part
@@ -226,7 +218,6 @@ def fetch_batches(cursor: pg8000.Cursor):
 
 def map_row_to_columns(row, column_names):
     return {column_names[i]: row[i] for i in range(len(column_names))}
-
 
 def table_extractor(
     table_name,
@@ -390,49 +381,44 @@ def db_extractor():
 
         # Process each table in a separate Process with Pipe  
         table_index = iter(tables)
-        processes: List[Tuple[Process, multi_processing_connection]] = (
+        workers: List[Tuple[Process, multi_processing_connection]] = (
             []
         )  # Holds the individual processes in tuples with the parent/manager pipes
         
-        # TODO: Logic to handle only 1-2 processors
-        # or fail if there are 2 processors or less
         print(
             f"Data Warehouse Lambda - INFO - {max_processes} processors available for use"
         )
         
         while True:
-            while len(processes) < max_processes:
-                try:
-                    table_name = next(table_index)
-                except StopIteration:
-                    # This exception is thrown when the next function can't find anything
-                    break
-                manager, worker = Pipe()
-                process = Process(
-                    target=table_extractor,
-                    args=(table_name, json_parameter_value, bucket_name, worker),
-                )
-                processes.append((process, manager))
-                process.start()
-            if not processes:
-                # No remaining processes are active
+            try:
+                table_name = next(table_index)
+            except StopIteration:
+                # This exception is thrown when the next function can't find anything
                 break
+            manager, worker = Pipe()
+            process = Process(
+                target=table_extractor,
+                args=(table_name, json_parameter_value, bucket_name, worker),
+            )
+            workers.append((process, manager))
+            process.start()
             
-            # Manage processes concurrently without sequential waiting
-            for i in range(len(processes) - 1, -1, -1):
-                # Temporarily free this processor so the workers can use it
-                yield_for_workers()
-                process, pipe = processes[i]
-                if not process.is_alive():
-                    # Process has finished, poll it and receive its message
-                    if pipe.poll():
-                        message = pipe.recv()
-                        print(f"Data Warehouse Lambda - INFO - {message}")
-                    pipe.close()
-                    process.join()
-                    processes.pop(
-                        i
-                    )  # Remove the finished process to free up processor capacity
+            if not workers:
+                # No remaining workers have jobs, db export complete
+                break
+
+            for i in range(len(workers) - 1, -1, -1):
+                finished_workers: List[multi_processing_connection | socket | int] = wait([mgr for (proc, mgr) in workers], timeout=None)
+                for finished_worker in finished_workers:
+                    # find the matching worker
+                    for i, (proc, mgr) in enumerate(workers):
+                        if mgr is finished_worker:
+                            if mgr.poll():
+                                message = mgr.recv()
+                                print(f"Data Warehouse Lambda - INFO - {message}")
+                                mgr.close()
+                                proc.join()
+                                workers.pop(i)
 
         # Create an SSM client
         try:
