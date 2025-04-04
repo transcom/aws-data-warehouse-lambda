@@ -2,6 +2,8 @@ import multiprocessing
 from multiprocessing.connection import Connection as multi_processing_connection
 from multiprocessing.connection import wait
 from multiprocessing import Process, Pipe
+from threading import Semaphore
+import resource
 from socket import socket
 import boto3
 import pg8000
@@ -20,7 +22,13 @@ from typing import List, Tuple
 current_run_time = datetime.datetime.now()
 
 # How many SQL records a worker will fetch at a time
-batch_size = 50000
+batch_size = 25000
+
+# Max amount of concurrent batch workers.
+# Not workers in general, just the amount allowed to work the batch processing
+# at the same time for a given table.
+# So X amount for table Y and X amount for table Z
+MAX_CONCURRENT_BATCH_WORKERS = 5
 
 # Lambda global connection for warm starts
 # This connection is only used to grab the table names
@@ -38,7 +46,7 @@ class UUIDEncoder(json.JSONEncoder):
             return obj.hex
         return json.JSONEncoder.default(self, obj)
 
-def parallel_worker(worker_conn, batch, column_names, key_name):
+def parallel_worker(worker_conn, batch, column_names, key_name, sema):
     # Handle process worker -> back to json mapping and
     # respond it back via the pipe. We'll convert a batch
     # of rows into JSON and then close the pipe with our response
@@ -50,6 +58,7 @@ def parallel_worker(worker_conn, batch, column_names, key_name):
         worker_conn.send(("error", f"ERROR: {e}\nKEY: {key_name}\nTrace: {tb}"))
     finally:
         worker_conn.close()
+        sema.release()
 
 def convert_batch_to_json(batch, column_names):
     # Convert a batch of rows to comma delimited JSON fragments (No start/end brackets)
@@ -63,6 +72,7 @@ def convert_batch_to_json(batch, column_names):
 def fetch_and_upload_cursor_results(
     cursor: pg8000.Cursor, bucket_name, key_name, column_names
 ):
+    sema = Semaphore(MAX_CONCURRENT_BATCH_WORKERS)
     s3_client = boto3.client("s3")
     # Initiate multipart upload
     multipart_upload = s3_client.create_multipart_upload(
@@ -77,6 +87,12 @@ def fetch_and_upload_cursor_results(
     buffer_size = 0
     min_part_size = 50 * 1024 * 1024  # 50 MB
     
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    mem_mb = usage.ru_maxrss / 1024  # KB to MB
+    print(
+        f"Data Warehouse Lambda - DEBUG - DB Extract - Creating batch generator for {bucket_name}/{key_name}\n"
+        f"Data Warehouse Lambda - DEBUG - Memory usage: {mem_mb:.2f} MB"
+    )
     batch_generator = fetch_batches(cursor)
     
     # Since a generator doesn't return a list, check the first case of if it is empty
@@ -120,20 +136,41 @@ def fetch_and_upload_cursor_results(
         # Early return, mark process to no longer be alive
         return
     
+    # Get memory usage
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    mem_mb = usage.ru_maxrss / 1024  # KB to MB
+    print(
+        f"Data Warehouse Lambda - DEBUG - DB Extract - Beginning worker generation for {bucket_name}/{key_name}\n"
+        f"Data Warehouse Lambda - DEBUG - Memory usage: {mem_mb:.2f} MB"
+    )
     # Create a manager -> worker process for each batch in parallel
     # This makes a manager and worker combo for every batch that we will await later
     workers: List[Tuple[Process, multi_processing_connection, int]] = []
     # Make sure we still process the first batch
     # fb = first batch
     fbManager, fbWorker = Pipe()
-    fbp = Process(target=parallel_worker, args=(fbWorker, first_batch, column_names, key_name))
+    fbp = Process(target=parallel_worker, args=(fbWorker, first_batch, column_names, key_name, sema))
     workers.append((fbp, fbManager, 1))
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    mem_mb = usage.ru_maxrss / 1024  # KB to MB
+    print(
+        f"Data Warehouse Lambda - DEBUG - DB Extract - Beginning first batch for {bucket_name}/{key_name}\n"
+        f"Data Warehouse Lambda - DEBUG - Memory usage: {mem_mb:.2f} MB"
+    )
     fbp.start()
     # Process remaining batches from the generator
     for i, batch in enumerate(batch_generator):
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        mem_mb = usage.ru_maxrss / 1024  # KB to MB
+        print(
+            f"Data Warehouse Lambda - DEBUG - DB Extract - Beginning batch {i} for {bucket_name}/{key_name}\n"
+            f"Data Warehouse Lambda - DEBUG - Memory usage: {mem_mb:.2f} MB"
+        )
+        
+        sema.acquire()
         manager, worker = Pipe()
-        p = Process(target=parallel_worker, args=(worker, batch, column_names, key_name))
-        workers.append((p, manager, i+1)) # +1 because of first batch preceding this
+        p = Process(target=parallel_worker, args=(worker, batch, column_names, key_name, sema))
+        workers.append((p, manager, i+1))  # +1 because of first batch preceding this
         p.start()
 
     #
@@ -148,6 +185,12 @@ def fetch_and_upload_cursor_results(
 
     # Concurrently wait for the workers to be complete
     while workers:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        mem_mb = usage.ru_maxrss / 1024  # KB to MB
+        print(
+            f"Data Warehouse Lambda - DEBUG - DB Extract - Waiting for workers for {bucket_name}/{key_name}\n"
+            f"Data Warehouse Lambda - DEBUG - Memory usage: {mem_mb:.2f} MB"
+        )
         finished_workers: List[multi_processing_connection | socket | int] = wait([mgr for (proc, mgr, bIndex) in workers], timeout=None)
         for finished_worker in finished_workers:
             is_last_worker = len(workers) == 1
@@ -222,7 +265,9 @@ def fetch_and_upload_cursor_results(
 # to boost processing efficiency
 def fetch_batches(cursor: pg8000.Cursor):
     while True:
-        batch = cursor.fetchmany(batch_size)
+        cursor.execute(f"FETCH FORWARD {batch_size} FROM data_cursor")
+        # Fetch data from client-side cursor that was provided by the server-side cursor
+        batch = cursor.fetchall()
         if not batch:
             # No more batch results
             break
@@ -231,6 +276,7 @@ def fetch_batches(cursor: pg8000.Cursor):
 
 def map_row_to_columns(row, column_names):
     return {column_names[i]: row[i] for i in range(len(column_names))}
+
 
 def table_extractor(
     table_name,
@@ -269,6 +315,7 @@ def table_extractor(
 
         # Set the statement timeout to 600 seconds for this session
         cursor.execute("SET statement_timeout = '600s'")
+        cursor.execute("BEGIN READ ONLY;")
 
         # Handle if the table being iterated on does not have updated_at or created_at
         # Since we do not have timestamps to compare to, we must full dump the table without updated or created at
@@ -278,30 +325,39 @@ def table_extractor(
                 + str(table_name)
             )
             # Tell the database to execute this query, we will ingest it in chunks
-            cursor.execute("SELECT * FROM " + str(table_name))
+            # Create a server-side cursor
+            cursor.execute(f"DECLARE data_cursor CURSOR FOR SELECT * FROM {table_name}")
             # Fetch cursor results and upload to S3
             fetch_and_upload_cursor_results(cursor, bucket_name, s3_key, column_names)
+            cursor.execute("CLOSE data_cursor")
+            cursor.execute("COMMIT;")
         # If we have created_at but no updated_at, we dump based only on created_at
         elif found_updated_at == False and found_created_at == True:
             last_run_time = json_parameter_value["data"]["lastRunTime"]
             cursor.execute(
-                "SELECT * FROM "
-                + str(table_name)
-                + " where (created_at > '"
-                + str(last_run_time)
-                + "') order by created_at;"
+                f"""
+                DECLARE data_cursor CURSOR FOR
+                SELECT * FROM {table_name}
+                WHERE created_at > %s
+                ORDER BY created_at
+                """,
+                (last_run_time,)
             )
             fetch_and_upload_cursor_results(cursor, bucket_name, s3_key, column_names)
+            cursor.execute("CLOSE data_cursor")
+            cursor.execute("COMMIT;")
         # If we have created_at and updated_at, we dump based on both
         elif found_updated_at == True and found_created_at == True:
             last_run_time = json_parameter_value["data"]["lastRunTime"]
-            cursor.execute(
-                "SELECT * FROM "
-                + str(table_name)
-                + " where ((created_at > %s) OR (updated_at > %s)) order by created_at;",
-                (last_run_time, last_run_time),
-            )
+            cursor.execute(f"""
+                DECLARE data_cursor CURSOR FOR 
+                SELECT * FROM {table_name}
+                WHERE ((created_at > %s) OR (updated_at > %s))
+                ORDER BY created_at
+            """, (last_run_time, last_run_time,))
             fetch_and_upload_cursor_results(cursor, bucket_name, s3_key, column_names)
+            cursor.execute("CLOSE data_cursor")
+            cursor.execute("COMMIT;")
         else:
             print(
                 "Data Warehouse Lambda - ERROR - DB Extract - "
@@ -378,7 +434,6 @@ def db_extractor():
             "archived_access_codes",
             "schema_migration",
             "audit_history_tableslist",
-            "audit_history",
             "v_locations",
         ]
 
