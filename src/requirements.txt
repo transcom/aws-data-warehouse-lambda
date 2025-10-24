@@ -4,3 +4,4 @@ six>=1.5
 asn1crypto==1.5.1
 boto3>=1.35.51
 boto3-stubs
+orjson==3.10.7

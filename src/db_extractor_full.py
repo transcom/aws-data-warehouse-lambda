@@ -16,6 +16,10 @@ import datetime
 import gc
 import traceback
 from typing import Any, Iterator, List, Tuple
+import orjson
+from decimal import Decimal
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures, FIRST_COMPLETED
+from botocore.config import Config
 
 # Storing current time, we will use this to update SSM when finished so that we
 # know for the next run which time to select from
@@ -67,12 +71,20 @@ def parallel_worker(worker_conn, batch, column_names, key_name):
         worker_conn.close()
 
 def convert_batch_to_json(batch, column_names):
-    # Convert a batch of rows to comma delimited JSON fragments (No start/end brackets)
-    records = []
+    def _default(o):
+        if isinstance(o, UUID): return o.hex
+        if isinstance(o, (datetime.datetime, datetime.date, datetime.time)): return str(o)
+        if isinstance(o, Decimal): return str(o)
+        return str(o)
+
+    out = io.BytesIO()
+    first = True
     for row in batch:
-        as_dict = map_row_to_columns(row, column_names)
-        records.append(json.dumps(as_dict, cls=UUIDEncoder, default=str))
-    return ",".join(records).encode("utf-8") # Return as bytes
+        if not first: out.write(b",")
+        else: first = False
+        obj = dict(zip(column_names, row))
+        out.write(orjson.dumps(obj, default=_default))
+    return out.getvalue()
 
 def upload_empty_json(s3_client, bucket_name, key_name, part_number, upload_id, parts):
     buffer = io.BytesIO()
@@ -110,7 +122,9 @@ def upload_empty_json(s3_client, bucket_name, key_name, part_number, upload_id, 
 def fetch_and_upload_cursor_results(
     cursor: pg8000.Cursor, bucket_name, key_name, column_names
 ):
-    s3_client = boto3.client("s3")
+    # Allow parallel S3 connections
+    s3_client = boto3.client("s3", config=Config(max_pool_connections=64))
+
     # Initiate multipart upload
     multipart_upload = s3_client.create_multipart_upload(
         Bucket=bucket_name,
@@ -118,250 +132,169 @@ def fetch_and_upload_cursor_results(
         ServerSideEncryption="AES256",
     )
     upload_id = multipart_upload["UploadId"]
-    parts = []
-    part_number = 1
+    parts = []                   # list of {"PartNumber": n, "ETag": "..."}
+    next_part_number = 1
+
+    # Where we assemble the final JSON array in parts
     buffer = io.BytesIO()
-    buffer_size = 0
+    wrote_any = False
     min_part_size = 50 * 1024 * 1024  # 50 MB
-    
-    print(f"Data Warehouse Lambda - DEBUG - DB Extract - Creating batch generator for {bucket_name}/{key_name}\n")
-    print_memory()
-    batch_generator = lookahead(fetch_batches(cursor))
-    
+
     #
     # Start our JSON output document
     #
     # Begin with our bracket as we are
     # going to format this manually
     buffer.write(b"[")
-    buffer_size += 1
 
-    print(
-        f"Data Warehouse Lambda - DEBUG - DB Extract - Beginning worker generation for {bucket_name}/{key_name}\n"
-    )
-    print_memory()
-    # Create a manager -> worker process for each batch in parallel
-    # This makes a manager and worker combo for every batch that we will await later
-    workers: List[Tuple[Process, multi_processing_connection, int, bool]] = []
+    # helper funcs
+    def _default(o):
+        if isinstance(o, UUID):
+            return o.hex
+        if isinstance(o, (datetime.datetime, datetime.date, datetime.time)):
+            return str(o)
+        if isinstance(o, Decimal):
+            return str(o)
+        return str(o)
 
-    # Process remaining batches from the generator
-    did_batches_run = False
-    all_workers_have_finished = False
-    total_finished_workers: List[Tuple[Process, multi_processing_connection, int, bool]] = []
-    for i, (batch, is_last_generator) in enumerate(batch_generator):
-        did_batches_run = True
-        print(
-            f"Data Warehouse Lambda - DEBUG - DB Extract - Beginning batch {i} for {bucket_name}/{key_name}\n"
-        )
-        print_memory()
-        
-        # Queue the worker
-        manager, worker = Pipe()
-        p = Process(target=parallel_worker, args=(worker, batch, column_names, key_name))
-        workers.append((p, manager, i, is_last_generator))
-        p.start()
-        
-        # Prep to extract the last batch worker from the queue
-        # This is done so that we can conditionally make sure
-        # that we close the JSON array properly `]` in the
-        # multi-part upload
-        last_batch_worker = None
-        
-        # If we hit the max amount of workers or it is the last generator
-        # then we want to infinitely loop until either a worker is freed
-        # or the loop is completely exited because the last generator is present
-        while len(workers) >= MAX_CONCURRENT_BATCH_WORKERS or (is_last_generator and not all_workers_have_finished):
-            # Max workers reached or this is the end of the line for the generator,
-            # before creating a new process we need to
-            # clear out the current workers
-            if len(workers) >= MAX_CONCURRENT_BATCH_WORKERS:
-                print(
-                f"Data Warehouse Lambda - DEBUG - DB Extract - Max concurrent batch workers reached for {bucket_name}/{key_name}\nbeginning upload\nHave all workers finished? {all_workers_have_finished}"
-                )
-            if is_last_generator:
-                print(
-                f"Data Warehouse Lambda - DEBUG - DB Extract - Last generator reached for {bucket_name}/{key_name}\nbeginning upload\nHave all workers finished? {all_workers_have_finished}"
-                )
-                
-            # Grab any finished worker managers
-            current_finished_worker_managers = wait(
-                [mgr for (_, mgr, _, _) in workers], timeout=5
-            )
-             
-            # Map the manager to the worker
-            current_finished_workers: List[Tuple[Process, multi_processing_connection, int, bool]] = [
-                (proc, mgr, bIndex, is_final_batch)
-                for (proc, mgr, bIndex, is_final_batch) in workers
-                if mgr in current_finished_worker_managers
-            ]
-            
-            print(
-                f"Data Warehouse Lambda - DEBUG - DB Extract - Found this many current finished worker managers {len(current_finished_worker_managers)} which translated to {len(current_finished_workers)} current finished workers {bucket_name}/{key_name}"
-            )
-            
-            # Add them to the total
-            for finished_worker in current_finished_workers:
-                # For each finished worker, find their respective `worker` entry
-                # and once found, add it to the total_finished_workers
-                for worker in workers:
-                    proc, mgr, batch_index, is_final_batch = worker
-                    if mgr is finished_worker[1] and worker not in total_finished_workers:
-                        total_finished_workers.append(worker)
-                        break
-                    
-            print(
-                f"With {len(current_finished_workers)} current finished workers, I now have {len(total_finished_workers)} total finished workers for {key_name}"
-            )
-            
-            # Iterate over each finished worker, we will poll and upload each of them
-            # making sure to only process the final batch worker last if present
-            for finished_worker in total_finished_workers:
-                proc, mgr, batch_index, is_final_batch = finished_worker
-                if last_batch_worker is None:
-                    print(
-                        f"No last batch worker found for {key_name}"
-                    )
-                    # Last batch worker hasn't been found yet
-                    # Check if this worker is the last batch worker
-                    if is_final_batch:
-                        print(
-                            f"Found the last batch worker found for {key_name}"
-                        )
-                        # This is the one
-                        last_batch_worker = finished_worker
-                if last_batch_worker is not None:
-                    print(
-                        f"if last_batch_worker is not None for {key_name} with a len of {len(workers)} workers"
-                    )
-                    # We know that if this worker is present, all remaining workers are present
-                    # We should only process the final worker if it is the last one
-                    # (Yes this if condition can be joined int one, but this is more readable)
-                    if len(workers) > 1:
-                        # There are unpopped workers present, we should not process the
-                        # final batch worker until it is the last one
-                        print(
-                        f"Data Warehouse Lambda - DEBUG - DB Extract - {bucket_name}/{key_name}\n attempted to poll the last worker while more remain, skipping"
-                        )
-                        # Instead of immediately continuing the loop, wait until the next worker is complete before continuing
-                        # This is a way of preserving CPU threads from being hogged by an infinite loop
-                        
-                        # Only wait for a new worker if there are any pending+
-                        # This is a good condition because it will only be run
-                        # if the final batch worker has been found, meaning
-                        # the len of total finished workers must be equal to len of workers
-                        # themselves
-                        if len(total_finished_workers) != len(workers):
-                            # Wait for the other worker that is not the last batch worker
-                            wait(
-                                [tfwMgr for (_, tfwMgr, _, _) in workers if tfwMgr is not last_batch_worker[1]],
-                                timeout=5
-                            )
-                        
-                        # Check if this worker is the last batch worker while len workers > 1
-                        # If len workers > 1 and this is the last batch worker, skip this worker and process the other one
-                        if mgr == last_batch_worker[1]:
-                            # This worker's manager is the same manager as the last batch worker, skip it
-                            continue
-                    
-                # Poll the manager, receive their message, upload and pop
-                print(
-                    f"Data Warehouse Lambda - DEBUG - DB Extract - Seeing if manager has a message for {bucket_name}/{key_name}"
-                )
-                if mgr.poll():
-                    print(
-                        f"Data Warehouse Lambda - DEBUG - DB Extract - polling manager with a len of {len(total_finished_workers)} total finished worker and len {len(workers)} workers for {bucket_name}/{key_name}"
-                    )
-                    msg_type, data = mgr.recv()
-                    mgr.close() # Free thread
-                    proc.join() # Make sure worker is done
-                    # Remove this worker from the workers list
-                    total_finished_workers.remove(finished_worker)
+    def encode_batch(batch):
+        # returns bytes of comma-joined objects; no brackets
+        out = io.BytesIO()
+        first = True
+        for row in batch:
+            if not first:
+                out.write(b",")
+            else:
+                first = False
+            obj = dict(zip(column_names, row))
+            out.write(orjson.dumps(obj, default=_default))
+        return out.getvalue()
 
-                    # Find the corresponding worker and pop it
-                    for j, w in enumerate(workers):
-                        # If the managers are the same, pop it
-                        if w[1] is mgr:
-                            workers.pop(j)
-                            break
-                    print(
-                        f"attempted to remove finished worker from total finished workers, new len of total finished workers is {len(total_finished_workers)} as well as len {len(workers)} workers for {key_name}\nIs final batch: {is_final_batch}"
-                    )
-                    is_final_worker = is_final_batch and len(workers) == 0 # Track if this is the last one
-                    if is_final_batch and len(workers) > 1:
-                        # This condition should be impossible as it would
-                        # allow the processing of the final batch worker
-                        # even though there are other workers to be processed first
-                        raise RuntimeError(f"Worker {key_name} unexpected error: the final batch worker is attempting to be polled even though they are not the last worker")
-                    if msg_type == "error":
-                        print(f"Data Warehouse Lambda - ERROR - Worker {batch_index} failed: {data}")
-                        raise RuntimeError(f"Worker {batch_index} error: {data}")
-                    print(
-                    f"Data Warehouse Lambda - INFO - DB Extract - {key_name} worker for batch index {batch_index} polled successfully. {len(workers)} workers remain"
-                    )
-                    # Add data fragment to buffer
-                    buffer.write(data)
-                    buffer_size += len(data)
-                    
-                    if not is_final_worker:
-                        # If it's not the last worker, append `,` to support a final
-                        # [${worker_1_json}, ${worker_2_json}, ${worker_3_json}] output
-                        buffer.write(b",")
-                        buffer_size += 1
-                        
-                    # Upload part if buffer reaches the minimum part size or
-                    # if this is the final worker
-                    if buffer_size >= min_part_size or is_final_worker:
-                        print(
-                            f"Triggering upload with buffer size {buffer_size} for {key_name}"
-                        )
-                        if is_final_worker:
-                            all_workers_have_finished = True
-                            print(f"Final worker for {key_name} for batch index {batch_index} reached, {len(workers)} workers remain")
-                            # Last call, close it up!
-                            buffer.write(b"]")
-                            buffer_size += 1
-                        buffer.seek(0)
-                        response = s3_client.upload_part(
-                            Bucket=bucket_name,
-                            Key=key_name,
-                            PartNumber=part_number,
-                            UploadId=upload_id,
-                            Body=buffer,
-                        )
-                        parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
-                        part_number += 1
-                        buffer = io.BytesIO()
-                        buffer_size = 0
+    # async upload pool; while a part uploads we keep writing to a new buffer
+    upload_pool = ThreadPoolExecutor(max_workers=4)
+    in_flight_uploads = []  # list of (part_number, Future)
 
-                        gc.collect()
-
-
-    if not did_batches_run:
-        # The for loop won't execute if the cursor returns no rows
-        upload_empty_json(s3_client, bucket_name, key_name, part_number, upload_id, parts)
-        # Early return
-        return
-        
-    print(
-    f"Data Warehouse Lambda - INFO - DB Extract - {key_name} workers complete, announcing multipart completion"
-    )
-
-    # Workers have completed and there is nothing left to upload to the multi-part
-    buffer.close()
-    del buffer
-    # Announce multipart upload completion
-    try:
-        s3_client.complete_multipart_upload(
+    def schedule_upload(buf: io.BytesIO, part_number: int):
+        buf.seek(0)
+        fut = upload_pool.submit(
+            s3_client.upload_part,
             Bucket=bucket_name,
             Key=key_name,
+            PartNumber=part_number,
             UploadId=upload_id,
-            MultipartUpload={"Parts": parts},
+            Body=buf,
         )
-    except Exception as e:
-        raise RuntimeError(f"Multipart upload completion error for {key_name}: {e}")
-    print(
-        f"Data Warehouse Lambda - INFO - DB Extract - Successfully wrote {bucket_name}/{key_name}"
+        in_flight_uploads.append((part_number, fut))
+
+    def drain_completed_uploads(block=False):
+        # collect finished uploads and append their ETags to parts (in order by part number)
+        if not in_flight_uploads:
+            return
+        if block:
+            # wait all
+            for pn, fut in in_flight_uploads:
+                resp = fut.result()
+                parts.append({"PartNumber": pn, "ETag": resp["ETag"]})
+            in_flight_uploads.clear()
+            return
+        # non-blocking: harvest any done ones
+        done = [i for i, (_, fut) in enumerate(in_flight_uploads) if fut.done()]
+        # pop backwards to not mess with i
+        for idx in reversed(done):
+            pn, fut = in_flight_uploads.pop(idx)
+            resp = fut.result()
+            parts.append({"PartNumber": pn, "ETag": resp["ETag"]})
+
+    def flush_if_needed(final=False):
+        nonlocal buffer, next_part_number, wrote_any
+        size = buffer.tell()
+        if (final and size > 0) or (size >= min_part_size):
+            # send current buffer and start a new one
+            current_buf = buffer
+            schedule_upload(current_buf, next_part_number)
+            next_part_number += 1
+            buffer = io.BytesIO()
+            drain_completed_uploads(block=False)
+
+    # fetch -> encode -> assemble -> upload
+    print(f"Data Warehouse Lambda - DEBUG - DB Extract - Creating batch generator for {bucket_name}/{key_name}")
+    print_memory()
+    batches = fetch_batches(cursor)  # yields lists of rows
+    enc_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_BATCH_WORKERS)
+    PREFETCH = MAX_CONCURRENT_BATCH_WORKERS * 2
+
+    # submit a few ahead
+    inflight = {}  # idx -> Future
+    next_idx = 0
+    next_to_write = 0
+
+    def submit_more():
+        nonlocal next_idx
+        try:
+            while len(inflight) < PREFETCH:
+                batch = next(batches)  # StopIteration handled
+                inflight[next_idx] = enc_pool.submit(encode_batch, batch)
+                next_idx += 1
+        except StopIteration:
+            pass
+
+    did_batches_run = False
+    submit_more()
+    while inflight:
+        did_batches_run = True
+        # wait for at least one encoding to complete
+        _ = wait_futures(inflight.values(), return_when=FIRST_COMPLETED)
+
+        # write any completed fragments in order
+        while next_to_write in inflight and inflight[next_to_write].done():
+            fragment = inflight.pop(next_to_write).result()  # bytes
+            if fragment:
+                if wrote_any:
+                    buffer.write(b",")
+                else:
+                    wrote_any = True
+                buffer.write(fragment)
+                flush_if_needed(final=False)
+            next_to_write += 1
+
+        submit_more()
+
+    if not did_batches_run:
+        # Close array and upload tiny object in one part
+        buffer.write(b"]")
+        buffer.seek(0)
+        resp = s3_client.upload_part(
+            Bucket=bucket_name,
+            Key=key_name,
+            PartNumber=next_part_number,
+            UploadId=upload_id,
+            Body=buffer,
+        )
+        parts.append({"PartNumber": next_part_number, "ETag": resp["ETag"]})
+        s3_client.complete_multipart_upload(
+            Bucket=bucket_name, Key=key_name, UploadId=upload_id, MultipartUpload={"Parts": parts}
+        )
+        print(f"Data Warehouse Lambda - INFO - DB Extract - Successfully wrote {bucket_name}/{key_name}")
+        return
+
+    # close JSON and flush final part
+    buffer.write(b"]")
+    flush_if_needed(final=True)
+
+    # wait all uploads and complete
+    drain_completed_uploads(block=True)
+    upload_pool.shutdown(wait=True)
+    enc_pool.shutdown(wait=True)
+
+    # Parts must be sorted by PartNumber
+    parts.sort(key=lambda p: p["PartNumber"])
+    s3_client.complete_multipart_upload(
+        Bucket=bucket_name,
+        Key=key_name,
+        UploadId=upload_id,
+        MultipartUpload={"Parts": parts},
     )
+    print(f"Data Warehouse Lambda - INFO - DB Extract - Successfully wrote {bucket_name}/{key_name}")
 
 # helper when fetching batches to look ahead in the generator
 # letting us know when we've reached the last entry in the
